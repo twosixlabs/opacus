@@ -13,6 +13,7 @@ from scipy.stats import planck
 from torch import Tensor, nn
 
 from opacus.grad_sample import GradSampleModule
+from .grad_sample.utils import accum_grads_across_passes
 from opacus.utils.tensor_utils import calc_sample_norms_one_layer
 
 from . import privacy_analysis
@@ -114,6 +115,8 @@ class PrivacyEngine:
         epochs: Optional[float] = None,
         loss_reduction: str = "mean",
         poisson: bool = False,
+        accum_passes: bool = False,
+        auto_clip_on_step: bool = True,
         **misc_settings,
     ):
         r"""
@@ -146,6 +149,7 @@ class PrivacyEngine:
         self.sample_size = sample_size
         self.sample_rate = sample_rate
         self._set_sample_rate()
+        self.auto_clip_on_step = auto_clip_on_step,
 
         if isinstance(
             module, DifferentiallyPrivateDistributedDataParallel
@@ -157,7 +161,7 @@ class PrivacyEngine:
             rank = 0
             n_replicas = 1
 
-        self.module = GradSampleModule(module)
+        self.module = GradSampleModule(module, accum_passes=accum_passes)
 
         if poisson:
             # TODO: Check directly if sampler is UniformSampler when sampler gets passed to the Engine (in the future)
@@ -457,6 +461,19 @@ class PrivacyEngine:
         """
         if self.clipper is not None:
             self.clipper.zero_grad()
+            
+    def set_accum_passes(self, accum_passes: bool):
+        self.module.set_accum_passes(accum_passes)
+        
+    def accum_grads_across_passes(self):
+        for _, p in self.clipper._named_params():
+            accum_grads_across_passes(p)
+            
+    def clip(self):
+        self.clipper.clip()
+        
+    def accumulate_batch(self):
+        self.clipper.accumulate_batch()
 
     def step(self, is_empty: bool = False):
         """
@@ -481,7 +498,9 @@ class PrivacyEngine:
         """
         self.steps += 1
         if not is_empty:
-            self.clipper.clip_and_accumulate()
+            if self.auto_clip_on_step:
+                self.clip()
+                self.accumulate_batch()
             clip_values, batch_size = self.clipper.pre_step()
         else:
             clip_values = (

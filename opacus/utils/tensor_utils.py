@@ -35,7 +35,7 @@ def calc_sample_norms(
     Returns:
         A list of tensor norms where length of the list is the number of layers
     """
-    norms = [param.view(len(param), -1).norm(2, dim=-1) for name, param in named_params]
+    norms = [param.view(param.size(0), param.size(1), -1).norm(2, dim=-1) for name, param in named_params]
     # calc norm over all layer norms if flat = True
     if flat:
         norms = [torch.stack(norms, dim=0).norm(2, dim=0)]

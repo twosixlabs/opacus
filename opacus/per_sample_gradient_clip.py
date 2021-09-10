@@ -147,15 +147,8 @@ class PerSampleGradientClipper:
         max_norm = threshs.new_full((n,), threshs.norm(2))
         self._reset_aggregated_state()
         return max_norm, batch_size
-
-    def clip_and_accumulate(self) -> None:
-        r"""
-        Clips and sums up per-sample gradients into an accumulator. When this function is called
-        ``N >= 1`` times on mini-batches of size ``B`` (could be smaller on final batch), a call to
-        :meth:`~opacus.per_sample_gradient_clip.PerSampleGradientClipper.pre_step`
-        will populate the ``.grad`` field with the average gradient over the entire batch of size
-        ``(N-1)* B + b`` with ``b <= B``.
-        """
+    
+    def clip(self) -> None:
         # step 0 : calculate the layer norms
         all_norms = calc_sample_norms(
             named_params=self._named_grad_samples(),
@@ -169,7 +162,7 @@ class PerSampleGradientClipper:
         self._aggr_thresh = torch.max(
             self._aggr_thresh, self.norm_clipper.thresholds
         )  # retain the largest clipping thresholds accross the entire batch
-        batch_size = next(p.shape[0] for (_, p) in self._named_grad_samples())
+        batch_size = next(p.size(1) for (_, p) in self._named_grad_samples())
         # The size for every param.grad_sample is the batch size
         self._aggr_batch_size += batch_size
 
@@ -178,26 +171,40 @@ class PerSampleGradientClipper:
         ):
             # Do the clipping
             name, p = named_param
-            summed_grad = self._weighted_sum(clip_factor, p.grad_sample)
+            # Loop through each pass
+            for i in range(p.grad_sample.size(0)):
+                # Loop through each sample
+                for j in range(batch_size):
+                    p.grad_sample[i,j] *= clip_factor[i][j]
+                    
+                    
+    def accumulate_batch(self) -> None:
+        for i, named_param in enumerate(self._named_params()):
+            name, p = named_param
+            
+            # Sum over passes and samples
+            summed_grad = torch.sum(torch.sum(p.grad_sample, dim=0), dim=0)
+            
             clipping_thresh = self.norm_clipper.thresholds[
                 i if len(self.norm_clipper.thresholds) > 1 else 0
             ]
-            per_sample_norm = all_norms[i if len(all_norms) > 1 else 0]
+            #per_sample_norm = all_norms[i if len(all_norms) > 1 else 0]
             # accumulate the summed gradient for this mini-batch
             if hasattr(p, "summed_grad"):
                 p.summed_grad += summed_grad
             else:
                 p.summed_grad = summed_grad
 
-            self._on_batch_clip(
-                name,
-                clip_factor,
-                clipping_thresh,
-                per_sample_norm,
-                p.grad_sample,
-                grad_before_clip=p.grad,
-                grad_after_clip=self._scale_summed_grad(summed_grad, batch_size),
-            )
+            # TO-DO: Figure out some way to replace this?
+#             self._on_batch_clip(
+#                 name,
+#                 clip_factor,
+#                 clipping_thresh,
+#                 per_sample_norm,
+#                 p.grad_sample,
+#                 grad_before_clip=p.grad,
+#                 grad_after_clip=self._scale_summed_grad(summed_grad, batch_size),
+#             )
 
             # remove the per-sample gradients
             del p.grad_sample
