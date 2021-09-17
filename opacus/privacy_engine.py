@@ -116,7 +116,9 @@ class PrivacyEngine:
         loss_reduction: str = "mean",
         poisson: bool = False,
         accum_passes: bool = False,
-        auto_clip_on_step: bool = True,
+        auto_clip_and_accum_on_step: bool = True,
+        use_imm_sens: bool = False,
+        per_sample: bool = True,
         **misc_settings,
     ):
         r"""
@@ -149,7 +151,14 @@ class PrivacyEngine:
         self.sample_size = sample_size
         self.sample_rate = sample_rate
         self._set_sample_rate()
-        self.auto_clip_on_step = auto_clip_on_step,
+        self.auto_clip_and_accum_on_step = auto_clip_and_accum_on_step
+        self.per_sample = per_sample
+        
+        if use_imm_sens:
+            raise Exception("IS not implemented")
+            
+        if (not use_imm_sens) and (not per_sample):
+            raise Exception("Gradient clipping must be per sample.")
 
         if isinstance(
             module, DifferentiallyPrivateDistributedDataParallel
@@ -462,6 +471,32 @@ class PrivacyEngine:
         if self.clipper is not None:
             self.clipper.zero_grad()
             
+    def disable_hooks(self) -> None:
+        if self.per_sample:
+            self.module.forward_hooks_enabled = False
+            self.module.backward_hooks_enabled = False
+
+    def enable_hooks(self) -> None:
+        if self.per_sample:
+            self.module.forward_hooks_enabled = True
+            self.module.backward_hooks_enabled = True
+
+    def disable_forward_hooks(self):
+        if self.per_sample:
+            self.module.forward_hooks_enabled = False
+        
+    def disable_backward_hooks(self):
+        if self.per_sample:
+            self.module.backward_hooks_enabled = False
+        
+    def enable_forward_hooks(self):
+        if self.per_sample:
+            self.module.forward_hooks_enabled = True
+        
+    def enable_backward_hooks(self):
+        if self.per_sample:
+            self.module.backward_hooks_enabled = True
+            
     def set_accum_passes(self, accum_passes: bool):
         self.module.set_accum_passes(accum_passes)
         
@@ -498,7 +533,7 @@ class PrivacyEngine:
         """
         self.steps += 1
         if not is_empty:
-            if self.auto_clip_on_step:
+            if self.auto_clip_and_accum_on_step:
                 self.clip()
                 self.accumulate_batch()
             clip_values, batch_size = self.clipper.pre_step()
@@ -513,7 +548,7 @@ class PrivacyEngine:
                 ]
             )
             batch_size = self.avg_batch_size
-
+        
         params = (p for p in self.module.parameters() if p.requires_grad)
         for p, clip_value in zip(params, clip_values):
             if self.rank == 0:
@@ -597,7 +632,8 @@ class PrivacyEngine:
             The advantage here is that this is memory-efficient: it discards the per-sample
             gradients after every mini-batch. We can thus handle batches of arbitrary size.
         """
-        self.clipper.clip_and_accumulate()
+        self.clipper.clip()
+        self.clipper.accumulate_batch()
 
     def _local_layer_ddp_hook(
         self, p: torch.Tensor, threshold: float, grad: torch.Tensor

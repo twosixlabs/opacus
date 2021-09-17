@@ -185,9 +185,9 @@ class PerSampleGradientClipper:
             # Sum over passes and samples
             summed_grad = torch.sum(torch.sum(p.grad_sample, dim=0), dim=0)
             
-            clipping_thresh = self.norm_clipper.thresholds[
-                i if len(self.norm_clipper.thresholds) > 1 else 0
-            ]
+#             clipping_thresh = self.norm_clipper.thresholds[
+#                 i if len(self.norm_clipper.thresholds) > 1 else 0
+#             ]
             #per_sample_norm = all_norms[i if len(all_norms) > 1 else 0]
             # accumulate the summed gradient for this mini-batch
             if hasattr(p, "summed_grad"):

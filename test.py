@@ -11,7 +11,7 @@ from opacus import PrivacyEngine
 
 private = True
 gp_lambda = 10
-batch_size = 5
+batch_size = 7
 
 
 def calc_gradient_penalties(netD, real_data, fake_data, batch_size, ch, dim, device="cpu"):
@@ -100,23 +100,31 @@ for i in range(10):
     real_loss = -D(real_in).mean()
     loss = real_loss + fake_loss
     loss.backward()
-    
-    print_grad_samples(D)
 
-    if private: pe.module.disable_hooks()
-        
+    pe.module.disable_backward_hooks()
     penalties = calc_gradient_penalties(D, real_in, fake_in, batch_size, 1, real_in.size(2), "cpu")
-    print("penalties:",penalties)
-        
-    # Loop through each sample in batch and calculate gradient of penalty with respect to D's parameters for each.
+    pe.module.enable_backward_hooks()
+    next(D.parameters()).register_hook(lambda g: print("     G:",g.shape))
     
-    for i in range(batch_size):
-        penalty_grad = gp_lambda * autograd.grad(penalties[i], D.parameters(), create_graph=True, retain_graph=True, allow_unused=True)
-        with torch.no_grad():
-            for i, p in enumerate(D.parameters()):
-                # Add penalty to both grad samples (real and fake) so that 
-                # Bias layers will have None gradient, so set to zero
-                p.grad_sample[0] += torch.unsqueeze(torch.zeros_like(p) if penalty_grad[i] is None else penalty_grad[i], dim=0)
+    penalties.mean().backward()
+    
+    
+#    print_grad_samples(D)
+       
+#    if private: pe.module.disable_hooks()
+        
+#     penalties = calc_gradient_penalties(D, real_in, fake_in, batch_size, 1, real_in.size(2), "cpu")
+#     print("penalties:",penalties)
+        
+#     # Loop through each sample in batch and calculate gradient of penalty with respect to D's parameters for each.
+    
+#     for i in range(batch_size):
+#         penalty_grad = gp_lambda * autograd.grad(penalties[i], D.parameters(), create_graph=True, retain_graph=True, allow_unused=True)
+#         with torch.no_grad():
+#             for i, p in enumerate(D.parameters()):
+#                 # Add penalty to both grad samples (real and fake) so that 
+#                 # Bias layers will have None gradient, so set to zero
+#                 p.grad_sample[0] += torch.unsqueeze(torch.zeros_like(p) if penalty_grad[i] is None else penalty_grad[i], dim=0)
             
     print_grad_samples(D)
     

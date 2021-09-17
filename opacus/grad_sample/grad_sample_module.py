@@ -23,11 +23,13 @@ class GradSampleModule(nn.Module):
     def __init__(self, m: nn.Module, *, batch_first=True, loss_reduction="mean", accum_passes=False):
         super().__init__()
         self._module = m
-        self.hooks_enabled = False
         self.batch_first = batch_first
         self.loss_reduction = loss_reduction
-        self.add_hooks(loss_reduction=loss_reduction, batch_first=batch_first)
         self.accum_passes = accum_passes
+        self.forward_hooks_enabled = False
+        self.backward_hooks_enabled = False
+        
+        self.add_hooks(loss_reduction=loss_reduction, batch_first=batch_first)
 
     def forward(self, x):
         return self._module(x)
@@ -95,7 +97,7 @@ class GradSampleModule(nn.Module):
                 )
 
                 self.autograd_grad_sample_hooks.append(
-                    module.register_backward_hook(
+                    module.register_full_backward_hook(
                         partial(
                             self.capture_backprops_hook,
                             loss_reduction=loss_reduction,
@@ -220,6 +222,7 @@ class GradSampleModule(nn.Module):
         if not self.backward_hooks_enabled:
             return
 
+        
         backprops = forward_output[0].detach()
         activations, backprops = self.rearrange_grad_samples(
             module, backprops, loss_reduction, batch_first
