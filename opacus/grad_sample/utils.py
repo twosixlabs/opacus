@@ -38,12 +38,11 @@ def create_or_accumulate_grad_sample(
         grad_sample: Per-sample gradients tensor. Must be of the same
             shape as ``param`` with extra batch dimension
     """
-    num_samples = grad_sample.shape[0]
-    
-    if hasattr(param, "grad_sample") and param.grad_sample.size(0) > 1:
-        if param.grad_sample.size(1) > 1:
+
+    if hasattr(param, "grad_sample") and param.grad_sample.size(0) > 0:
+        if param.grad_sample.size(0) > 1:
             raise Exception("create_or_accumulate_grad_sample called after create_or_extend_grad_sample without calling accum_grads_across_passes between.")
-            
+
         param.grad_sample[0] += grad_sample
     else:
         # TO-DO: What is the point of this?
@@ -53,7 +52,7 @@ def create_or_accumulate_grad_sample(
 #             device=grad_sample.device,
 #             dtype=grad_sample.dtype,
 #         )
-        param.grad_sample = torch.unsqueeze(grad_sample, dim=0)
+        param.grad_sample = torch.unsqueeze(grad_sample, dim=0).detach()
 
 def accum_grads_across_passes(param: torch.Tensor) -> None:
     if param.grad_sample.size(0) > 1:

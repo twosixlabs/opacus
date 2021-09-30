@@ -28,7 +28,7 @@ class GradSampleModule(nn.Module):
         self.accum_passes = accum_passes
         self.forward_hooks_enabled = False
         self.backward_hooks_enabled = False
-        
+
         self.add_hooks(loss_reduction=loss_reduction, batch_first=batch_first)
 
     def forward(self, x):
@@ -148,19 +148,19 @@ class GradSampleModule(nn.Module):
 
     def disable_forward_hooks(self):
         self.forward_hooks_enabled = False
-        
+
     def disable_backward_hooks(self):
         self.backward_hooks_enabled = False
-        
+
     def enable_forward_hooks(self):
         self.forward_hooks_enabled = True
-        
+
     def enable_backward_hooks(self):
         self.backward_hooks_enabled = True
-        
+
     def set_accum_passes(accum_passes: bool):
         self.accum_passes = accum_passes
-        
+
     def parametrized_modules(self) -> Iterable[nn.Module]:
         """
         Recursively iterates over all submodules, returning those that
@@ -221,8 +221,7 @@ class GradSampleModule(nn.Module):
         """Captures backprops in backward pass and store per-sample gradients."""
         if not self.backward_hooks_enabled:
             return
-
-        
+            
         backprops = forward_output[0].detach()
         activations, backprops = self.rearrange_grad_samples(
             module, backprops, loss_reduction, batch_first
@@ -287,7 +286,7 @@ class GradSampleModule(nn.Module):
             B = B.permute([batch_dim] + [x for x in range(B.dim()) if x != batch_dim])
 
         return A, B
-    
+
     @classmethod
     def is_supported(cls, module: nn.Module) -> bool:
         """Check if this module is supported"""

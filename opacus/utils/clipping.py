@@ -220,7 +220,7 @@ class ConstantFlatClipper(NormClipper):
                 "Waring: flat norm selected but "
                 f"received norm for {len(norms)} layers"
             )
-        per_sample_clip_factors = [[(self.flat_value / (n + 1e-6)).clamp(max=1.0) for n in pass_norms] for pass_norms in norms]
+        per_sample_clip_factors = torch.stack([torch.stack([(self.flat_value / (n + 1e-6)).clamp(max=1.0) for n in pass_norms], dim=0) for pass_norms in norms], dim=0)
         # return this clipping factor for all layers
         return cycle(per_sample_clip_factors)
 
@@ -298,10 +298,11 @@ class ConstantPerLayerClipper(NormClipper):
         for param_norms, threshold in zip(norms, self.flat_values):
             param_clip_factors = []
             for pass_norms in param_norms:
-                pass_clip_factors = [(threshold / (norm + 1e-6)).clamp(max=1.0) for norm in pass_norms]
-                
-            clipping_factors.append(param_clip_factor)
-            
+                param_clip_factors.append(torch.tensor([(threshold / (norm + 1e-6)).clamp(max=1.0) for norm in pass_norms]))
+
+            param_clip_factors = torch.stack(param_clip_factors)
+            clipping_factors.append(param_clip_factors)
+
         return clipping_factors
 
     @property

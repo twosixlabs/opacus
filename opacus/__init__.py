@@ -4,7 +4,8 @@
 from . import utils
 from .per_sample_gradient_clip import PerSampleGradientClipper
 from .privacy_engine import PrivacyEngine
+from .is_privacy_engine import ISPrivacyEngine
 from .version import __version__
 
 
-__all__ = ["PrivacyEngine", "PerSampleGradientClipper", "utils", "__version__"]
+__all__ = ["PrivacyEngine", "ISPrivacyEngine", "PerSampleGradientClipper", "utils", "__version__"]
