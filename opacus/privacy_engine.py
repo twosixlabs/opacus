@@ -117,6 +117,9 @@ class PrivacyEngine:
         poisson: bool = False,
         accum_passes: bool = False,
         auto_clip_and_accum_on_step: bool = True,
+        use_moving_avg_mgn: bool = True,
+        moving_avg_mgn_beta: float = 0.99,
+        moving_avg_mgn_target: float = 5,
         **misc_settings,
     ):
         r"""
@@ -187,6 +190,9 @@ class PrivacyEngine:
         else:
             self.noise_multiplier = noise_multiplier
 
+        if isinstance(max_grad_norm, float) and use_moving_avg_mgn:
+            raise ValueError("In order to use moving average max grad norm, initialize max grad norm as a list of per-parameter values.")
+
         self.max_grad_norm = max_grad_norm
         self.alphas = alphas
         self.target_delta = target_delta
@@ -195,6 +201,9 @@ class PrivacyEngine:
         self.misc_settings = misc_settings
         self.n_replicas = n_replicas
         self.rank = rank
+        self.use_moving_avg_mgn = use_moving_avg_mgn
+        self.moving_avg_mgn_beta = moving_avg_mgn_beta
+        self.moving_avg_mgn_target = moving_avg_mgn_target
 
         self.device = next(module.parameters()).device
         self.steps = 0
@@ -495,6 +504,10 @@ class PrivacyEngine:
     def accumulate_batch(self):
         self.clipper.accumulate_batch()
 
+    def set_max_grad_norm(self, max_grad_norm: List[float]):
+        self.max_grad_norm = max_grad_norm
+        self.clipper.norm_clipper.flat_values = max_grad_norm
+
     def step(self, is_empty: bool = False):
         """
         Takes a step for the privacy engine.
@@ -535,7 +548,7 @@ class PrivacyEngine:
             batch_size = self.avg_batch_size
 
         params = (p for p in self.module.parameters() if p.requires_grad)
-        for p, clip_value in zip(params, clip_values):
+        for i, (p, clip_value) in enumerate(zip(params, clip_values)):
             if self.rank == 0:
                 # Noise only gets added on first worker
                 # This is easy to reason about for loss_reduction=sum
@@ -550,6 +563,11 @@ class PrivacyEngine:
             # We have to divide by avg_batch_size instead of batch_size
             if self.poisson and self.loss_reduction == "mean":
                 p.grad *= batch_size / self.avg_batch_size
+
+            if self.use_moving_avg_mgn:
+                b = self.moving_avg_mgn_beta
+                self.max_grad_norm[i] = (b*self.max_grad_norm[i] + (1-b)*p.grad.reshape(-1).norm(2)*self.moving_avg_mgn_target).cpu().item()
+
 
     def to(self, device: Union[str, torch.device]):
         """

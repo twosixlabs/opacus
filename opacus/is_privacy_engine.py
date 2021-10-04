@@ -34,6 +34,8 @@ class ISPrivacyEngine(PrivacyEngine):
         epochs: Optional[float] = None,
         poisson: bool = False,
         per_param: bool = False,
+        scaling_vec: List[float] = None,
+        beta: float = 0.0,
         **misc_settings,
     ):
 
@@ -46,6 +48,8 @@ class ISPrivacyEngine(PrivacyEngine):
 
         self.per_param = per_param
         self.batch_sensitivity = []
+        self.scaling_vec = [1.0 for _ in module.parameters()] if scaling_vec is None else scaling_vec
+        self.beta = beta
 
         if isinstance(
             module, DifferentiallyPrivateDistributedDataParallel
@@ -237,6 +241,9 @@ class ISPrivacyEngine(PrivacyEngine):
         """
         return self._poisson_empty_batches_distribution.rvs(size=1)[0]
 
+    def set_scaling_vec(self, scaling_vec: List[float]):
+        self.scaling_vec = scaling_vec
+
     def get_renyi_divergence(self):
         rdp = torch.tensor(
             privacy_analysis.compute_rdp(
@@ -277,14 +284,17 @@ class ISPrivacyEngine(PrivacyEngine):
     def zero_grad(self):
         self.batch_sensitivity = 0
 
-    def backward(self, loss, inputs):
+    def backward(self, loss, inputs, store_to_grad=True):
         # (1) first-order gradient (wrt parameters)
         first_order_grads = torch.autograd.grad(loss, self.module.parameters(), retain_graph=True, create_graph=True)
-        # with torch.no_grad():
-        #     for i, p in enumerate(self.module.parameters()):
-        #         p.grad = first_order_grads[i]
+
+        if store_to_grad:
+            # Store gradients while we're at it so we don't have to loss.backward()
+            for i, p in enumerate(self.module.parameters()):
+                p.grad = first_order_grads[i].detach()
 
         if self.per_param:
+            # Not sure if this is working properly
             self.batch_sensitivity = []
             grad_l2_norms = torch.stack([x.view(-1).norm(2) for x in first_order_grads], dim=0)
 
@@ -297,7 +307,7 @@ class ISPrivacyEngine(PrivacyEngine):
             print(self.batch_sensitivity)
         else:
             # (2) L2 norm of the gradient from (1)
-            grad_l2_norm = torch.norm(torch.cat([x.view(-1) for x in first_order_grads]), p=2)
+            grad_l2_norm = torch.norm(torch.cat([x.reshape(-1) / self.scaling_vec[i] for i, x in enumerate(first_order_grads)]), p=2)
 
             # (3) Gradient (wrt inputs) of the L2 norm of the gradient from (2)
             sensitivity_vec = torch.autograd.grad(grad_l2_norm, inputs, retain_graph=True)[0]
@@ -312,8 +322,8 @@ class ISPrivacyEngine(PrivacyEngine):
 
         params = (p for p in self.module.parameters() if p.requires_grad)
         for i, p in enumerate(params):
-            sens = self.batch_sensitivity[i] if self.per_param else self.batch_sensitivity
-            noise = self._generate_noise(sens * self.noise_multiplier, p)
+            sens = np.exp(self.beta) * self.batch_sensitivity[i] if self.per_param else self.batch_sensitivity
+            noise = self._generate_noise(sens * self.scaling_vec[i], p.grad)
 
             if self.rank == 0:
                 # Noise only gets added on first worker
