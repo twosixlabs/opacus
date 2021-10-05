@@ -117,6 +117,7 @@ class PrivacyEngine:
         poisson: bool = False,
         accum_passes: bool = False,
         auto_clip_and_accum_on_step: bool = True,
+        num_private_passes: Optional[int] = None,
         use_moving_avg_mgn: bool = True,
         moving_avg_mgn_beta: float = 0.99,
         moving_avg_mgn_target: float = 5,
@@ -153,6 +154,15 @@ class PrivacyEngine:
         self.sample_rate = sample_rate
         self._set_sample_rate()
         self.auto_clip_and_accum_on_step = auto_clip_and_accum_on_step
+
+        if accum_passes:
+            if not num_private_passes is None:
+                raise ValueError("Provided num_private_passes with accum_passes=True, so there is only one pass!")
+            num_private_passes = 1
+        if num_private_passes is None and not accum_passes:
+            raise ValueError("Must provide num_private_passes if using 'split' clipping (i.e. accum_passes=False)")
+
+        self.num_private_passes = num_private_passes
 
         if isinstance(
             module, DifferentiallyPrivateDistributedDataParallel
@@ -554,7 +564,7 @@ class PrivacyEngine:
                 # This is easy to reason about for loss_reduction=sum
                 # For loss_reduction=mean, noise will get further divided by
                 # world_size as gradients are averaged.
-                noise = self._generate_noise(clip_value, p.grad)
+                noise = self._generate_noise(clip_value * self.num_private_passes, p.grad)
                 if self.loss_reduction == "mean":
                     noise /= batch_size
                 p.grad += noise

@@ -2,6 +2,36 @@
 
 <hr/>
 
+# Calvin's README
+Changes from original Opacus:
+1. Immediate sensitivity implementation as an alternate privacy engine (ISPrivacyEngine)
+
+ISPrivacyEngine shares the same accounting and many other features as the normal PrivacyEngine, but requires that you call .backward() through the privacy engine.
+This is to avoid computing the gradients twice when calculating IS.
+
+2. Slight rework of how per-sample gradients are handled and stored
+
+In the original Opacus implementation, a new "sample" is added to parameter.grad_sample each time a backward hook on that parameter is triggered.
+This causes some undesireable behavior when multiple backward calls happen in an iteration, such as when training a GAN (fake loss and real loss).
+In the [Opacus DCGAN example](https://github.com/calvinhirsch/opacus/blob/calvin-branch/examples/dcgan.py), they address this by doing two optimizer steps per iteration.
+However, this may lead to differing optimizer performance from a standard training formulation.
+In addition, the privacy engine accounting then counts steps only on fake (generated) data, unnecessarily doubling the step count in the accounting.
+This implementation changes parameter.grad_sample from shape (n_batch, *) to shape (n_passes, n_batch, *), where n_passes is the number of backward passes through that parameter.
+In addition, it offers two modes: accum_passes={True, False}.
+Either the gradients can be accumulated (summed) across passes and then the summed per-sample gradients can be clipped or the per-sample gradients from different passes can be stored separately, clipped separately, and then summed (this method requires passing a value for the number of these passes that contain sensitive data in order to scale the noise accordingly).
+
+These methods can be found implemented in my [pytorch implementation of DP-CGAN](), where basic clipping shows accum_passes=True and split clipping shows accum_passes=False.
+
+3. Made it easier to customize private training procedure
+
+Default Opacus behavior is to clip the per-sample gradients and accumulate them into summed_grad before anything else when .step() is called.
+This implementation moves clip() and accumulate_batch() to their own functions that will either be called automatically, preserving default behavior, when auto_clip_and_accum_on_step is left as True, or setting it to false allows them to be called manually instead. In addition, when specifying accum_passes=False, .accum_passes() can be called manually.
+
+
+<hr/>
+
+# Orignal README
+
 [![CircleCI](https://circleci.com/gh/pytorch/opacus.svg?style=svg)](https://circleci.com/gh/pytorch/opacus)
 
 [Opacus](https://opacus.ai) is a library that enables training PyTorch models with differential privacy. It supports training with minimal code changes required on the client, has little impact on training performance and allows the client to online track the privacy budget expended at any given moment.
