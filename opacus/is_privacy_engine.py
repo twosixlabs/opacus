@@ -48,7 +48,7 @@ class ISPrivacyEngine(PrivacyEngine):
 
         self.per_param = per_param
         self.batch_sensitivity = []
-        self.scaling_vec = [1.0 for _ in module.parameters()] if scaling_vec is None else scaling_vec
+        self.set_scaling_vec([1.0 for _ in module.parameters()] if scaling_vec is None else scaling_vec)
         self.beta = beta
 
         if isinstance(
@@ -243,6 +243,7 @@ class ISPrivacyEngine(PrivacyEngine):
 
     def set_scaling_vec(self, scaling_vec: List[float]):
         self.scaling_vec = scaling_vec
+        self.scaling_vec_n = torch.nn.functional.normalize(torch.tensor(scaling_vec), dim=0).detach().numpy()
 
     def get_renyi_divergence(self):
         rdp = torch.tensor(
@@ -304,10 +305,11 @@ class ISPrivacyEngine(PrivacyEngine):
 
                 self.batch_sensitivity.append(np.max(s))
 
+            print("WARNING: per-param IS not fully implemented and may not be working properly.")
             print(self.batch_sensitivity)
         else:
             # (2) L2 norm of the gradient from (1)
-            grad_l2_norm = torch.norm(torch.cat([x.reshape(-1) / self.scaling_vec[i] for i, x in enumerate(first_order_grads)]), p=2)
+            grad_l2_norm = torch.norm(torch.cat([x.reshape(-1) / self.scaling_vec_n[i] for i, x in enumerate(first_order_grads)]), p=2)
 
             # (3) Gradient (wrt inputs) of the L2 norm of the gradient from (2)
             sensitivity_vec = torch.autograd.grad(grad_l2_norm, inputs, retain_graph=True)[0]
@@ -323,7 +325,7 @@ class ISPrivacyEngine(PrivacyEngine):
         params = (p for p in self.module.parameters() if p.requires_grad)
         for i, p in enumerate(params):
             sens = np.exp(self.beta) * self.batch_sensitivity[i] if self.per_param else self.batch_sensitivity
-            noise = self._generate_noise(sens * self.scaling_vec[i], p.grad)
+            noise = self._generate_noise(sens * self.scaling_vec_n[i], p.grad)
 
             if self.rank == 0:
                 # Noise only gets added on first worker

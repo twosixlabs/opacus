@@ -27,6 +27,9 @@ These methods can be found implemented in my [pytorch implementation of DP-CGAN]
 Default Opacus behavior is to clip the per-sample gradients and accumulate them into summed_grad before anything else when .step() is called.
 This implementation moves clip() and accumulate_batch() to their own functions that will either be called automatically, preserving default behavior, when auto_clip_and_accum_on_step is left as True, or setting it to false allows them to be called manually instead. In addition, when specifying accum_passes=False, .accum_passes() can be called manually.
 
+4. Added moving average clipping to privacy engine
+
+Added a simple moving average for gradient norm multiplied by some constant at each layer that adaptively changes clipping parameter over time. Alternate adaptive clipping strategies can be implemented by calling privacy_engine.set_max_grad_norm().
 
 <hr/>
 
