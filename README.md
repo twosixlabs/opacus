@@ -20,7 +20,7 @@ This implementation changes parameter.grad_sample from shape (n_batch, *) to sha
 In addition, it offers two modes: accum_passes={True, False}.
 Either the gradients can be accumulated (summed) across passes and then the summed per-sample gradients can be clipped or the per-sample gradients from different passes can be stored separately, clipped separately, and then summed (this method requires passing a value for the number of these passes that contain sensitive data in order to scale the noise accordingly).
 
-These methods can be found implemented in my [pytorch implementation of DP-CGAN](), where basic clipping shows accum_passes=True and split clipping shows accum_passes=False.
+These methods can be found implemented in my [pytorch implementation of DP-CGAN](https://github.com/calvinhirsch/dp-cgan-pytorch), where basic clipping shows accum_passes=True and split clipping shows accum_passes=False.
 
 3. Made it easier to customize private training procedure
 
