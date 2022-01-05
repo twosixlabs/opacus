@@ -221,7 +221,7 @@ class GradSampleModule(nn.Module):
         """Captures backprops in backward pass and store per-sample gradients."""
         if not self.backward_hooks_enabled:
             return
-            
+
         backprops = forward_output[0].detach()
         activations, backprops = self.rearrange_grad_samples(
             module, backprops, loss_reduction, batch_first

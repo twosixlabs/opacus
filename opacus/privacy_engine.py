@@ -12,6 +12,8 @@ import torch
 from scipy.stats import planck
 from torch import Tensor, nn
 
+import numpy as np
+
 from opacus.grad_sample import GradSampleModule
 from .grad_sample.utils import accum_grads_across_passes
 from opacus.utils.tensor_utils import calc_sample_norms_one_layer
@@ -24,6 +26,7 @@ from .layers.dp_ddp import (
 )
 from .per_sample_gradient_clip import PerSampleGradientClipper
 from .utils import clipping
+from .utils import tensor_utils
 
 DEFAULT_ALPHAS = [1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64))
 
@@ -118,9 +121,6 @@ class PrivacyEngine:
         accum_passes: bool = False,
         auto_clip_and_accum_on_step: bool = True,
         num_private_passes: Optional[int] = None,
-        use_moving_avg_mgn: bool = True,
-        moving_avg_mgn_beta: float = 0.99,
-        moving_avg_mgn_target: float = 5,
         **misc_settings,
     ):
         r"""
@@ -200,9 +200,6 @@ class PrivacyEngine:
         else:
             self.noise_multiplier = noise_multiplier
 
-        if isinstance(max_grad_norm, float) and use_moving_avg_mgn:
-            raise ValueError("In order to use moving average max grad norm, initialize max grad norm as a list of per-parameter values.")
-
         self.max_grad_norm = max_grad_norm
         self.alphas = alphas
         self.target_delta = target_delta
@@ -211,9 +208,6 @@ class PrivacyEngine:
         self.misc_settings = misc_settings
         self.n_replicas = n_replicas
         self.rank = rank
-        self.use_moving_avg_mgn = use_moving_avg_mgn
-        self.moving_avg_mgn_beta = moving_avg_mgn_beta
-        self.moving_avg_mgn_target = moving_avg_mgn_target
 
         self.device = next(module.parameters()).device
         self.steps = 0
@@ -253,11 +247,11 @@ class PrivacyEngine:
                 "/dev/urandom"
             )
         else:
-            warnings.warn(
-                "Secure RNG turned off. This is perfectly fine for experimentation as it allows "
-                "for much faster training performance, but remember to turn it on and retrain "
-                "one last time before production with ``secure_rng`` turned on."
-            )
+            # warnings.warn(
+            #     "Secure RNG turned off. This is perfectly fine for experimentation as it allows "
+            #     "for much faster training performance, but remember to turn it on and retrain "
+            #     "one last time before production with ``secure_rng`` turned on."
+            # ) muting this warning because it's annoying
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 self.seed = int.from_bytes(os.urandom(8), byteorder="big", signed=True)
@@ -516,7 +510,12 @@ class PrivacyEngine:
 
     def set_max_grad_norm(self, max_grad_norm: List[float]):
         self.max_grad_norm = max_grad_norm
-        self.clipper.norm_clipper.flat_values = max_grad_norm
+        if isinstance(self.clipper.norm_clipper, clipping.ConstantFlatClipper):
+            self.clipper.norm_clipper.flat_value = max_grad_norm
+        elif isinstance(self.clipper.norm_clipper, clipping.ConstantPerLayerClipper):
+            self.clipper.norm_clipper.flat_values = max_grad_norm
+        else:
+            raise Exception("PrivacyEngine.clipper.norm_clipper unsupported type")
 
     def step(self, is_empty: bool = False):
         """
@@ -573,10 +572,6 @@ class PrivacyEngine:
             # We have to divide by avg_batch_size instead of batch_size
             if self.poisson and self.loss_reduction == "mean":
                 p.grad *= batch_size / self.avg_batch_size
-
-            if self.use_moving_avg_mgn:
-                b = self.moving_avg_mgn_beta
-                self.max_grad_norm[i] = (b*self.max_grad_norm[i] + (1-b)*p.grad.reshape(-1).norm(2)*self.moving_avg_mgn_target).cpu().item()
 
 
     def to(self, device: Union[str, torch.device]):
@@ -804,10 +799,11 @@ class PrivacyEngine:
             else:
                 self.sample_rate = self.batch_size / self.sample_size
                 if self.batch_size is not None or self.sample_size is not None:
-                    warnings.warn(
-                        "The sample rate will be defined from ``batch_size`` and ``sample_size``."
-                        "The returned privacy budget will be incorrect."
-                    )
+                    # warnings.warn(
+                    #     "The sample rate will be defined from ``batch_size`` and ``sample_size``."
+                    #     "The returned privacy budget will be incorrect."
+                    # )
+                    pass # muting this warning because it's annoying
 
             self.avg_batch_size = self.sample_rate * self.sample_size
         else:

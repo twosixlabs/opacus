@@ -36,6 +36,8 @@ from typing import Callable, Iterator, Optional, Tuple
 import torch
 from torch import nn
 
+import numpy as np
+
 from opacus.grad_sample import GradSampleModule
 
 from .utils.clipping import NormClipper
@@ -211,6 +213,7 @@ class PerSampleGradientClipper:
 
             # remove the per-sample gradients
             del p.grad_sample
+
         self._on_batch_clip()  # inform analysis of the whole module
 
     def zero_grad(self):

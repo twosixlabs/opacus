@@ -328,7 +328,6 @@ class ConstantPerLayerClipper(NormClipper):
         """
         return True
 
-
 class _Dynamic_Clipper_(NormClipper):
     """
     This is a generic clipper, that is in an experimental phase.
