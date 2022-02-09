@@ -220,11 +220,9 @@ class ConstantFlatClipper(NormClipper):
                 "Waring: flat norm selected but "
                 f"received norm for {len(norms)} layers"
             )
-        per_sample_clip_factor = self.flat_value / (norms[0] + 1e-6)
-        # We are *clipping* the gradient, so if the factor is ever >1 we set it to 1
-        per_sample_clip_factor = per_sample_clip_factor.clamp(max=1.0)
+        per_sample_clip_factors = torch.stack([torch.stack([(self.flat_value / (n + 1e-6)).clamp(max=1.0) for n in pass_norms], dim=0) for pass_norms in norms], dim=0)
         # return this clipping factor for all layers
-        return cycle([per_sample_clip_factor])
+        return cycle(per_sample_clip_factors)
 
     @property
     def thresholds(self) -> torch.Tensor:
@@ -296,11 +294,16 @@ class ConstantPerLayerClipper(NormClipper):
             len(norms) if len(self.flat_values) == 1 else 1
         )
 
-        clipping_factor = []
-        for norm, threshold in zip(norms, self.flat_values):
-            per_sample_clip_factor = threshold / (norm + 1e-6)
-            clipping_factor.append(per_sample_clip_factor.clamp(max=1.0))
-        return clipping_factor
+        clipping_factors = []
+        for param_norms, threshold in zip(norms, self.flat_values):
+            param_clip_factors = []
+            for pass_norms in param_norms:
+                param_clip_factors.append(torch.tensor([(threshold / (norm + 1e-6)).clamp(max=1.0) for norm in pass_norms]))
+
+            param_clip_factors = torch.stack(param_clip_factors)
+            clipping_factors.append(param_clip_factors)
+
+        return clipping_factors
 
     @property
     def thresholds(self) -> torch.Tensor:
@@ -324,7 +327,6 @@ class ConstantPerLayerClipper(NormClipper):
             Flag with value True
         """
         return True
-
 
 class _Dynamic_Clipper_(NormClipper):
     """

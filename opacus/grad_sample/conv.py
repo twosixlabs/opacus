@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
-from typing import Union
+from typing import Union, Callable
 
 import numpy as np
 import torch
 import torch.nn as nn
 from opacus.utils.tensor_utils import unfold3d
 
-from .utils import create_or_extend_grad_sample, register_grad_sampler
+from .utils import create_or_extend_grad_sample
+from .register_grad_sampler import register_grad_sampler
 
 
 @register_grad_sampler([nn.Conv1d, nn.Conv2d, nn.Conv3d])
@@ -16,7 +17,8 @@ def compute_conv_grad_sample(
     layer: Union[nn.Conv2d, nn.Conv1d],
     A: torch.Tensor,
     B: torch.Tensor,
-    batch_dim: int = 0,
+    add_grad_sample_fn: Callable[[torch.tensor, torch.tensor, int], None],
+    batch_dim: int = 0
 ) -> None:
     """
     Computes per sample gradients for convolutional layers
@@ -74,7 +76,7 @@ def compute_conv_grad_sample(
     grad_sample = torch.einsum("ngrg...->ngr...", grad_sample).contiguous()
     shape = [n] + list(layer.weight.shape)
 
-    create_or_extend_grad_sample(layer.weight, grad_sample.view(shape), batch_dim)
+    add_grad_sample_fn(layer.weight, grad_sample.view(shape), batch_dim)
 
     if layer.bias is not None:
-        create_or_extend_grad_sample(layer.bias, torch.sum(B, dim=2), batch_dim)
+        add_grad_sample_fn(layer.bias, torch.sum(B, dim=2), batch_dim)

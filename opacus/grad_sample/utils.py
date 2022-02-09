@@ -1,38 +1,8 @@
 #!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
-from typing import Sequence, Union
-
 import torch
 import torch.nn as nn
-
-from .grad_sample_module import GradSampleModule
-
-
-def register_grad_sampler(target_class_or_classes: Union[type, Sequence[type]]):
-    """
-    Registers the decorated function as the ``grad_sampler`` of ``target_class_or_classes``, which is
-    the function that will be invoked every time you want to compute a per-sample gradient
-    of ``target_class_or_classes``. The signature of every grad_sampler is always the same:
-
-    >>> @register_grad_sampler(nn.MyCustomClass)
-    >>> def compute_grad_sample(module, activations, backprops):
-    >>>    pass
-
-    It may help you to take a look at the existing grad_samplers inside Opacus, under ``opacus.grad_sample.``
-    """
-
-    def decorator(f):
-        target_classes = (
-            target_class_or_classes
-            if isinstance(target_class_or_classes, Sequence)
-            else [target_class_or_classes]
-        )
-        for target_class in target_classes:
-            GradSampleModule.GRAD_SAMPLERS[target_class] = f
-        return f
-
-    return decorator
 
 
 def create_or_extend_grad_sample(
@@ -51,13 +21,13 @@ def create_or_extend_grad_sample(
     """
 
     if hasattr(param, "grad_sample"):
-        param.grad_sample = torch.cat((param.grad_sample, grad_sample), batch_dim)
+        param.grad_sample = torch.cat((param.grad_sample, torch.unsqueeze(grad_sample, dim=0)), batch_dim)
     else:
-        param.grad_sample = grad_sample
+        param.grad_sample = torch.unsqueeze(grad_sample, dim=0)
 
 
 def create_or_accumulate_grad_sample(
-    param: torch.Tensor, grad_sample: torch.Tensor, layer: nn.Module
+    param: torch.Tensor, grad_sample: torch.Tensor, batch_dim: int #layer: nn.Module
 ) -> None:
     """
     Creates a ``grad_sample`` attribute in the given parameter, or adds to it
@@ -69,13 +39,25 @@ def create_or_accumulate_grad_sample(
             shape as ``param`` with extra batch dimension
     """
 
-    if hasattr(param, "grad_sample"):
-        param.grad_sample[: grad_sample.shape[0]] += grad_sample
+    if hasattr(param, "grad_sample") and param.grad_sample.size(0) > 0:
+        if param.grad_sample.size(0) > 1:
+            raise Exception("create_or_accumulate_grad_sample called after create_or_extend_grad_sample without calling accum_grads_across_passes between.")
+
+        param.grad_sample[0] += grad_sample
     else:
-        max_batch_len = layer.max_batch_len
-        param.grad_sample = torch.zeros(
-            torch.Size([max_batch_len]) + grad_sample.shape[1:],
-            device=grad_sample.device,
-            dtype=grad_sample.dtype,
-        )
-        param.grad_sample[: grad_sample.shape[0]] = grad_sample
+        # TO-DO: What is the point of this?
+#         param.grad_sample = torch.zeros(
+#             torch.Size([max_batch_len]) + grad_sample.shape[1:],
+#             grad_sample.shape,
+#             device=grad_sample.device,
+#             dtype=grad_sample.dtype,
+#         )
+        param.grad_sample = torch.unsqueeze(grad_sample, dim=0).detach()
+
+def accum_grads_across_passes(param: torch.Tensor) -> None:
+    if param.grad_sample.size(0) > 1:
+        for i in range(1, param.grad_sample.size(0)):
+            param.grad_sample[0] += param.grad_sample[i]
+        param.grad_sample = torch.unsqueeze(param.grad_sample[0], dim=0)
+    else:
+        raise Exception("One or fewer ({}) previous passes of grad_samples are stored, nothing to accumulate!".format(param.grad_sample.size(0)))

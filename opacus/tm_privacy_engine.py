@@ -26,61 +26,9 @@ from .layers.dp_ddp import (
 )
 from .per_sample_gradient_clip import PerSampleGradientClipper
 from .utils import clipping
-from .utils import tensor_utils
-
-DEFAULT_ALPHAS = [1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64))
 
 
-def get_noise_multiplier(
-    target_epsilon: float,
-    target_delta: float,
-    sample_rate: float,
-    epochs: int,
-    alphas: List[float],
-    sigma_min: Optional[float] = 0.01,
-    sigma_max: Optional[float] = 10.0,
-) -> float:
-    r"""
-    Computes the noise level sigma to reach a total budget of (target_epsilon, target_delta)
-    at the end of epochs, with a given sample_rate
-
-    Args:
-        target_epsilon: the privacy budget's epsilon
-        target_delta: the privacy budget's delta
-        sample_rate: the sampling rate (usually batch_size / n_data)
-        epochs: the number of epochs to run
-        alphas: the list of orders at which to compute RDP
-
-    Returns:
-        The noise level sigma to ensure privacy budget of (target_epsilon, target_delta)
-
-    """
-    eps = float("inf")
-    while eps > target_epsilon:
-        sigma_max = 2 * sigma_max
-        rdp = privacy_analysis.compute_rdp(
-            sample_rate, sigma_max, epochs / sample_rate, alphas
-        )
-        eps = privacy_analysis.get_privacy_spent(alphas, rdp, target_delta)[0]
-        if sigma_max > 2000:
-            raise ValueError("The privacy budget is too low.")
-
-    while sigma_max - sigma_min > 0.01:
-        sigma = (sigma_min + sigma_max) / 2
-        rdp = privacy_analysis.compute_rdp(
-            sample_rate, sigma, epochs / sample_rate, alphas
-        )
-        eps = privacy_analysis.get_privacy_spent(alphas, rdp, target_delta)[0]
-
-        if eps < target_epsilon:
-            sigma_max = sigma
-        else:
-            sigma_min = sigma
-
-    return sigma
-
-
-class PrivacyEngine:
+class TMPrivacyEngine:
     r"""
     The main component of Opacus is the ``PrivacyEngine``.
 
@@ -105,22 +53,19 @@ class PrivacyEngine:
         self,
         module: nn.Module,
         *,  # As per PEP 3102, this forces clients to specify kwargs explicitly, not positionally
-        sample_rate: Optional[float] = None,
         batch_size: Optional[int] = None,
         sample_size: Optional[int] = None,
-        max_grad_norm: Union[float, List[float]],
-        noise_multiplier: Optional[float] = None,
-        alphas: List[float] = DEFAULT_ALPHAS,
         secure_rng: bool = False,
         batch_first: bool = True,
         target_delta: float = 1e-6,
         target_epsilon: Optional[float] = None,
         epochs: Optional[float] = None,
-        loss_reduction: str = "mean",
-        poisson: bool = False,
-        accum_passes: bool = False,
-        auto_clip_and_accum_on_step: bool = True,
-        num_private_passes: Optional[int] = None,
+        rho_per_epoch: float = 1000,
+        smooth_sens_t: float = 0.01,
+        m_trim: float = 10,
+        min_val: float = -1,
+        max_val: float = 1,
+        sens_compute_bs: int = 256,
         **misc_settings,
     ):
         r"""
@@ -147,61 +92,21 @@ class PrivacyEngine:
         """
 
         self.steps = 0
-        self.poisson = poisson
-        self.loss_reduction = loss_reduction
+
         self.batch_size = batch_size
         self.sample_size = sample_size
-        self.sample_rate = sample_rate
-        self._set_sample_rate()
-        self.auto_clip_and_accum_on_step = auto_clip_and_accum_on_step
-
-        if accum_passes:
-            if not num_private_passes is None:
-                raise ValueError("Provided num_private_passes with accum_passes=True, so there is only one pass!")
-            num_private_passes = 1
-        if num_private_passes is None and not accum_passes:
-            raise ValueError("Must provide num_private_passes if using 'split' clipping (i.e. accum_passes=False)")
-
-        self.num_private_passes = num_private_passes
 
         if isinstance(
             module, DifferentiallyPrivateDistributedDataParallel
         ) or isinstance(module, torch.nn.parallel.DistributedDataParallel):
             rank = torch.distributed.get_rank()
             n_replicas = torch.distributed.get_world_size()
-            self.sample_rate *= n_replicas
         else:
             rank = 0
             n_replicas = 1
 
-        self.module = GradSampleModule(module, accum_passes=accum_passes)
+        self.module = GradSampleModule(module, accum_passes=True)
 
-        if poisson:
-            # TODO: Check directly if sampler is UniformSampler when sampler gets passed to the Engine (in the future)
-            if sample_size is None:
-                raise ValueError(
-                    "If using Poisson sampling, sample_size should get passed to the PrivacyEngine."
-                )
-
-            # Number of empty batches follows a geometric distribution
-            # Planck is the same distribution but its parameter is the (negative) log of the geometric's parameter
-            self._poisson_empty_batches_distribution = planck(
-                -math.log(1 - self.sample_rate) * self.sample_size
-            )
-
-        if noise_multiplier is None:
-            if target_epsilon is None or target_delta is None or epochs is None:
-                raise ValueError(
-                    "If noise_multiplier is not specified, (target_epsilon, target_delta, epochs) should be given to the engine."
-                )
-            self.noise_multiplier = get_noise_multiplier(
-                target_epsilon, target_delta, self.sample_rate, epochs, alphas
-            )
-        else:
-            self.noise_multiplier = noise_multiplier
-
-        self.max_grad_norm = max_grad_norm
-        self.alphas = alphas
         self.target_delta = target_delta
         self.secure_rng = secure_rng
         self.batch_first = batch_first
@@ -209,18 +114,20 @@ class PrivacyEngine:
         self.n_replicas = n_replicas
         self.rank = rank
 
+        self.smooth_sens_t = smooth_sens_t
+        self.m_trim = m_trim
+        self.min_val = min_val
+        self.max_val = max_val
+        self.sens_compute_bs = sens_compute_bs
+
+        self.rho_per_epoch = rho_per_epoch
+        self.rho_per_weight = rho_per_epoch / sum(p.numel() for p in self.module.parameters() if p.requires_grad)
+        self._optimize_sigma()
+
+        self.trimmed_this_batch = False
+
         self.device = next(module.parameters()).device
         self.steps = 0
-
-        if self.noise_multiplier < 0:
-            raise ValueError(
-                f"noise_multiplier={self.noise_multiplier} is not a valid value. Please provide a float >= 0."
-            )
-
-        if isinstance(self.max_grad_norm, float) and self.max_grad_norm <= 0:
-            raise ValueError(
-                f"max_grad_norm={self.max_grad_norm} is not a valid value. Please provide a float > 0."
-            )
 
         if not self.target_delta:
             if self.sample_size:
@@ -247,11 +154,11 @@ class PrivacyEngine:
                 "/dev/urandom"
             )
         else:
-            # warnings.warn(
-            #     "Secure RNG turned off. This is perfectly fine for experimentation as it allows "
-            #     "for much faster training performance, but remember to turn it on and retrain "
-            #     "one last time before production with ``secure_rng`` turned on."
-            # ) muting this warning because it's annoying
+            warnings.warn(
+                "Secure RNG turned off. This is perfectly fine for experimentation as it allows "
+                "for much faster training performance, but remember to turn it on and retrain "
+                "one last time before production with ``secure_rng`` turned on."
+            )
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 self.seed = int.from_bytes(os.urandom(8), byteorder="big", signed=True)
@@ -319,40 +226,6 @@ class PrivacyEngine:
                 return
 
         self.validator.validate(self.module)
-        norm_clipper = (
-            clipping.ConstantFlatClipper(self.max_grad_norm)
-            if not isinstance(self.max_grad_norm, list)
-            else clipping.ConstantPerLayerClipper(self.max_grad_norm)
-        )
-
-        if self.misc_settings.get("experimental", False):
-            norm_clipper = clipping._Dynamic_Clipper_(
-                [self.max_grad_norm],
-                self.misc_settings.get("clip_per_layer", False),
-                self.misc_settings.get(
-                    "clipping_method", clipping.ClippingMethod.STATIC
-                ),
-                self.misc_settings.get("clipping_ratio", 0.0),
-                self.misc_settings.get("clipping_momentum", 0.0),
-            )
-
-        self.clipper = PerSampleGradientClipper(
-            self.module,
-            norm_clipper,
-            self.batch_first,
-            self.loss_reduction,
-        )
-
-        if isinstance(self.module._module, torch.nn.parallel.DistributedDataParallel):
-            if isinstance(norm_clipper, clipping.ConstantPerLayerClipper):
-                # The DDP hooks are stored in `self.privacy_engine.module.ddp_hooks`
-                self._register_ddp_hooks()
-            else:
-                raise ValueError(
-                    """The Opacus DDP hook only supports constant per-layer clipping.
-                     If you need a different clipper for simple (not optimized) distributed training,
-                     you can use `opacus.layers.dp_ddp.DifferentiallyPrivateDistributedDataParallel`"""
-                )
 
         def dp_zero_grad(self):
             self.privacy_engine.zero_grad()
@@ -374,24 +247,11 @@ class PrivacyEngine:
                     average_gradients(self.privacy_engine.module)
             self.original_step(closure)
 
-        def poisson_dp_step(self, closure=None):
-            # Perform one step as usual
-            self.dp_step(closure)
-
-            # Taking empty steps to simulate empty batches
-            num_empty_batches = self.privacy_engine._sample_poisson_empty_batches()
-            for _ in range(num_empty_batches):
-                self.zero_grad()
-                self.dp_step(closure, is_empty=True)
-
         optimizer.privacy_engine = self
 
         optimizer.dp_step = types.MethodType(dp_step, optimizer)
         optimizer.original_step = optimizer.step
-
-        optimizer.step = types.MethodType(
-            poisson_dp_step if self.poisson else dp_step, optimizer
-        )
+        optimizer.step = types.MethodType(dp_step, optimizer)
 
         optimizer.original_zero_grad = optimizer.zero_grad
         optimizer.zero_grad = types.MethodType(dp_zero_grad, optimizer)
@@ -406,58 +266,12 @@ class PrivacyEngine:
         # create a cross reference for detaching
         self.optimizer = optimizer
 
-        if self.poisson:
-            # Optional initial step on empty batch
-            num_empty_batches = self._sample_poisson_empty_batches()
-            for _ in range(num_empty_batches):
-                self.optimizer.zero_grad()
-                for p in self.module.parameters():
-                    if p.requires_grad:
-                        p.grad = torch.zeros_like(p)
-                self.optimizer.dp_step(closure=None, is_empty=True)
-
-    def _sample_poisson_empty_batches(self):
-        """
-        Samples an integer which is equal to the number of (consecutive) empty batches when doing Poisson sampling
-        """
-        return self._poisson_empty_batches_distribution.rvs(size=1)[0]
-
-    def get_renyi_divergence(self):
-        rdp = torch.tensor(
-            privacy_analysis.compute_rdp(
-                self.sample_rate, self.noise_multiplier, 1, self.alphas
-            )
-        )
-        return rdp
-
     def get_privacy_spent(
         self, target_delta: Optional[float] = None
     ) -> Tuple[float, float]:
-        """
-        Computes the (epsilon, delta) privacy budget spent so far.
-
-        This method converts from an (alpha, epsilon)-DP guarantee for all alphas that
-        the ``PrivacyEngine`` was initialized with. It returns the optimal alpha together
-        with the best epsilon.
-
-        Args:
-            target_delta: The Target delta. If None, it will default to the privacy
-                engine's target delta.
-
-        Returns:
-            Pair of epsilon and optimal order alpha.
-        """
-        if target_delta is None:
-            if self.target_delta is None:
-                raise ValueError(
-                    "If self.target_delta is not specified, target_delta should be set as argument to get_privacy_spent."
-                )
-            target_delta = self.target_delta
-        rdp = self.get_renyi_divergence() * self.steps
-        eps, best_alpha = privacy_analysis.get_privacy_spent(
-            self.alphas, rdp, target_delta
-        )
-        return float(eps), float(best_alpha)
+        n_epochs = int((self.steps-1) * (self.batch_size // self.sample_size))+1 # round up
+        rho = self.rho_per_epoch * n_epochs
+        return rho + 2*np.sqrt(rho * np.log(1/target_delta)), target_delta
 
     def zero_grad(self):
         """
@@ -498,81 +312,54 @@ class PrivacyEngine:
     def set_accum_passes(self, accum_passes: bool):
         self.module.set_accum_passes(accum_passes)
 
-    def accum_grads_across_passes(self):
-        for _, p in self.clipper._named_params():
-            accum_grads_across_passes(p)
+    def trim_grads(self):
+        with torch.no_grad():
+            batch_size = next(iter(self.module.parameters())).grad_sample.size(1)
 
-    def clip(self):
-        self.clipper.clip()
+            # Generate indices now so they don't need to be every time (will be xs[idx1] - xs[idx2])
+            ks = torch.arange(0, batch_size+1, device=self.device) # distances
+            ls = torch.arange(0, batch_size+2, device=self.device)
+            # Use all l values then take lower triangular part of matrix (with diagonal shifted by one) to remove values where l > k+1
+            idx1 = torch.tril(batch_size - self.m_trim + 1 + ks.reshape(-1, 1) - ls, diagonal=1).clamp(-1, batch_size)
+            idx2 = (self.m_trim + 1 - ls).clamp(-1, batch_size).reshape(1, -1)
+            scalar = torch.exp(-1 * ks * self.smooth_sens_t)
 
-    def accumulate_batch(self):
-        self.clipper.accumulate_batch()
+            for p in (pa for pa in self.module.parameters() if pa.requires_grad):
+                # reshape p.grad_sample to shape (num_params_in_layer, batch_size)
+                grad_shape = p.grad_sample.shape[2:]
+                p.grad_sample = p.grad_sample.reshape(batch_size, -1).transpose(0, 1).clamp(self.min_val, self.max_val).sort(dim=1).values
 
-    def set_max_grad_norm(self, max_grad_norm: List[float]):
-        self.max_grad_norm = max_grad_norm
-        if isinstance(self.clipper.norm_clipper, clipping.ConstantFlatClipper):
-            self.clipper.norm_clipper.flat_value = max_grad_norm
-        elif isinstance(self.clipper.norm_clipper, clipping.ConstantPerLayerClipper):
-            self.clipper.norm_clipper.flat_values = max_grad_norm
-        else:
-            raise Exception("PrivacyEngine.clipper.norm_clipper unsupported type")
+                num_params = p.grad_sample.size(0)
+                p.grad_sample = torch.cat((p.grad_sample, torch.full((num_params, 1), self.max_val, device=self.device), torch.full((num_params, 1), self.min_val, device=self.device)), dim=1)
+
+                # Compute sensitivities
+                sensitivities = []
+                for batch_of_grads in torch.split(p.grad_sample, self.sens_compute_bs):
+                    diffs = torch.tril(batch_of_grads[:,idx1] - batch_of_grads[:,idx2], diagonal=1)
+                    inner_max = diffs.max(dim=2).values
+                    outer_max = (inner_max*scalar).max(dim=1).values
+
+                    sensitivities.append(outer_max)
+                sensitivities = torch.cat(sensitivities, dim=0).reshape(grad_shape)
+
+                # Compute trimmed means from p.grad_sample and put in p.grad
+                p.grad = p.grad_sample[:,self.m_trim:batch_size-self.m_trim].mean(dim=1).reshape(grad_shape)
+                # Add noise scaled by sensitivities
+                p.grad += sensitivities*self.sens_scale * torch.distributions.laplace.Laplace(torch.zeros(grad_shape, device=self.device), torch.ones(grad_shape, device=self.device)).sample() * torch.exp(self.sigma * torch.empty(grad_shape, device=self.device).normal_())
+                #print((sensitivities*self.sens_scale * torch.distributions.laplace.Laplace(torch.zeros(grad_shape, device=self.device), torch.ones(grad_shape, device=self.device)).sample() * torch.exp(self.sigma * torch.empty(grad_shape, device=self.device).normal_())).std())
+
+                del sensitivities
+                del p.grad_sample
+
+        self.trimmed_this_batch = True
 
     def step(self, is_empty: bool = False):
-        """
-        Takes a step for the privacy engine.
-
-        Args:
-            is_empty: Whether the step is taken on an empty batch
-                In this case, we do not call clip_and_accumulate since there are no
-                per sample gradients.
-
-        Notes:
-            You should not call this method directly. Rather, by attaching your
-            ``PrivacyEngine`` to the optimizer, the ``PrivacyEngine`` would have
-            the optimizer call this method for you.
-
-        Raises:
-            ValueError: If the last batch of training epoch is greater than others.
-                This ensures the clipper consumed the right amount of gradients.
-                In the last batch of a training epoch, we might get a batch that is
-                smaller than others but we should never get a batch that is too large
-
-        """
         self.steps += 1
-        if not is_empty:
-            if self.auto_clip_and_accum_on_step:
-                self.clip()
-                self.accumulate_batch()
-            clip_values, batch_size = self.clipper.pre_step()
-        else:
-            clip_values = (
-                self.max_grad_norm
-                if type(self.max_grad_norm) is list
-                else [
-                    self.max_grad_norm
-                    for p in self.module.parameters()
-                    if p.requires_grad
-                ]
-            )
-            batch_size = self.avg_batch_size
 
-        params = (p for p in self.module.parameters() if p.requires_grad)
-        for i, (p, clip_value) in enumerate(zip(params, clip_values)):
-            if self.rank == 0:
-                # Noise only gets added on first worker
-                # This is easy to reason about for loss_reduction=sum
-                # For loss_reduction=mean, noise will get further divided by
-                # world_size as gradients are averaged.
-                noise = self._generate_noise(clip_value * self.num_private_passes, p.grad)
-                if self.loss_reduction == "mean":
-                    noise /= batch_size
-                p.grad += noise
+        if not self.trimmed_this_batch:
+            self.trim_grads()
 
-            # For poisson, we are not supposed to know the batch size
-            # We have to divide by avg_batch_size instead of batch_size
-            if self.poisson and self.loss_reduction == "mean":
-                p.grad *= batch_size / self.avg_batch_size
-
+        self.trimmed_this_batch = False
 
     def to(self, device: Union[str, torch.device]):
         """
@@ -687,65 +474,10 @@ class PrivacyEngine:
 
         # Only one GPU adds noise
         if self.rank == 0:
-            noise = self._generate_noise(clip_value, new_grad)
-            if self.loss_reduction == "mean":
-                noise /= batch_size
+            noise = self._generate_noise(clip_value, new_grad) / batch_size
             new_grad += noise
 
-        # Poisson uses avg_batch_size instead of batch_size
-        if self.poisson and self.loss_reduction == "mean":
-            new_grad *= batch_size / self.avg_batch_size
-
         return new_grad
-
-    def _register_ddp_hooks(self):
-        """
-        Adds hooks for DP training over DistributedDataParallel.
-
-        Each layer has a hook that clips and noises the gradients as soon as they are ready.
-        """
-
-        # `thresholds` is a tensor with `len(params)` thresholds (i.e. max layer norm)
-        params = (p for p in self.module.parameters() if p.requires_grad)
-        thresholds = self.clipper.norm_clipper.thresholds
-
-        # Register and store the DDP hooks (one per layer). GradSampleModule knows how to remove them.
-        self.module.ddp_hooks = []
-        for p, threshold in zip(params, thresholds):
-            if not p.requires_grad:
-                continue
-
-            self.module.ddp_hooks.append(
-                p.register_hook(partial(self._local_layer_ddp_hook, p, threshold))
-            )
-
-    def _generate_noise(
-        engine, max_grad_norm: float, grad: torch.Tensor
-    ) -> torch.Tensor:
-        r"""
-        Generates a tensor of Gaussian noise of the same shape as ``grad``.
-
-        The generated tensor has zero mean and standard deviation
-        sigma = ``noise_multiplier x max_grad_norm ``
-
-        Args:
-            max_grad_norm : The maximum norm of the per-sample gradients.
-            grad : The gradient of the reference, based on which the dimension of the
-                noise tensor will be determined
-
-        Returns:
-            the generated noise with noise zero and standard
-            deviation of ``noise_multiplier x max_grad_norm ``
-        """
-        if engine.noise_multiplier > 0 and max_grad_norm > 0:
-            return torch.normal(
-                0,
-                engine.noise_multiplier * max_grad_norm,
-                grad.shape,
-                device=engine.device,
-                generator=engine.random_number_generator,
-            )
-        return torch.zeros(grad.shape, device=engine.device)
 
     def _set_seed(self, seed: int):
         r"""
@@ -773,52 +505,26 @@ class PrivacyEngine:
             else torch.cuda.manual_seed(self.seed)
         )
 
-    def _set_sample_rate(self):
-        r"""
-        Determine the ``sample_rate``.
+    def _optimize_sigma(self):
+        def opt_exp(eps, t, sigma):
+            return 5 * (eps / t) * sigma**3 - 5 * sigma**2 - 1
 
-        If a ``sample_rate`` is provided, it will be used.
-        If no ``sample_rate``is provided, the used ``sample_rate`` will be equal to
-        ``batch_size`` /  ``sample_size``.
-        """
-        if self.batch_size and not isinstance(self.batch_size, int):
-            raise ValueError(
-                f"batch_size={self.batch_size} is not a valid value. Please provide a positive integer."
-            )
+        target_eps = np.sqrt(2*self.rho_per_weight)
+        sigma_lower = self.smooth_sens_t / target_eps
+        sigma_upper = max(2*self.smooth_sens_t / target_eps, 1/2)
 
-        if self.sample_size and not isinstance(self.sample_size, int):
-            raise ValueError(
-                f"sample_size={self.sample_size} is not a valid value. Please provide a positive integer."
-            )
-
-        if self.sample_rate is None:
-            if self.batch_size is None or self.sample_size is None:
-                raise ValueError(
-                    "You must provide (batch_size and sample_sizes) or sample_rate."
-                )
+        loss = opt_exp(target_eps, self.smooth_sens_t, np.mean([sigma_lower, sigma_upper]))
+        while np.abs(loss) > 0.001:
+            if loss < 0:
+                sigma_lower = np.mean([sigma_lower, sigma_upper])
             else:
-                self.sample_rate = self.batch_size / self.sample_size
-                if self.batch_size is not None or self.sample_size is not None:
-                    # warnings.warn(
-                    #     "The sample rate will be defined from ``batch_size`` and ``sample_size``."
-                    #     "The returned privacy budget will be incorrect."
-                    # )
-                    pass # muting this warning because it's annoying
+                sigma_upper = np.mean([sigma_lower, sigma_upper])
 
-            self.avg_batch_size = self.sample_rate * self.sample_size
-        else:
-            warnings.warn(
-                "A ``sample_rate`` has been provided."
-                "Thus, the provided ``batch_size``and ``sample_size`` will be ignored."
-            )
-            if self.poisson:
-                if self.loss_reduction == "mean" and not self.sample_size:
-                    raise ValueError(
-                        "Sample size has to be provided if using Poisson and loss_reduction=mean."
-                    )
-                self.avg_batch_size = self.sample_rate * self.sample_size
+            loss = opt_exp(target_eps, self.smooth_sens_t, np.mean([sigma_lower, sigma_upper]))
 
-        if self.sample_rate > 1.0:
-            raise ValueError(
-                f"sample_rate={self.sample_rate} is not a valid value. Please provide a float between 0 and 1."
-            )
+        self.sigma = np.mean([sigma_lower, sigma_upper])
+        print(self.sigma)
+        self.sens_scale = 1/(np.exp(-(3/2) * self.sigma**2) * (target_eps - (self.smooth_sens_t / self.sigma)))
+        print(self.sens_scale)
+        self.steps += 5
+        print(self.get_privacy_spent(1e-6))

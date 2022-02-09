@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from opacus.layers.dp_lstm import DPLSTM, LSTMLinear
 from opacus.utils.module_inspection import requires_grad
+from opacus.grad_sample.utils import create_or_extend_grad_sample, create_or_accumulate_grad_sample
 
 
 class UnsupportedModuleError(ValueError):
@@ -19,12 +20,15 @@ class GradSampleModule(nn.Module):
     """
     GRAD_SAMPLERS = {}
 
-    def __init__(self, m: nn.Module, *, batch_first=True, loss_reduction="mean"):
+    def __init__(self, m: nn.Module, *, batch_first=True, loss_reduction="mean", accum_passes=False):
         super().__init__()
         self._module = m
-        self.hooks_enabled = False
         self.batch_first = batch_first
         self.loss_reduction = loss_reduction
+        self.accum_passes = accum_passes
+        self.forward_hooks_enabled = False
+        self.backward_hooks_enabled = False
+
         self.add_hooks(loss_reduction=loss_reduction, batch_first=batch_first)
 
     def forward(self, x):
@@ -93,7 +97,7 @@ class GradSampleModule(nn.Module):
                 )
 
                 self.autograd_grad_sample_hooks.append(
-                    module.register_backward_hook(
+                    module.register_full_backward_hook(
                         partial(
                             self.capture_backprops_hook,
                             loss_reduction=loss_reduction,
@@ -131,14 +135,31 @@ class GradSampleModule(nn.Module):
         a bug in Autograd that makes removing hooks do nothing if the graph was already
         constructed. For this reason, we have this method to at least turn them off.
         """
-        self.hooks_enabled = False
+        self.forward_hooks_enabled = False
+        self.backward_hooks_enabled = False
 
     def enable_hooks(self) -> None:
         r"""
         The opposite of ``disable_hooks()``. Hooks are always enabled unless you explicitly
         disable them so you don't need to call this unless you want to re-enable them.
         """
-        self.hooks_enabled = True
+        self.forward_hooks_enabled = True
+        self.backward_hooks_enabled = True
+
+    def disable_forward_hooks(self):
+        self.forward_hooks_enabled = False
+
+    def disable_backward_hooks(self):
+        self.backward_hooks_enabled = False
+
+    def enable_forward_hooks(self):
+        self.forward_hooks_enabled = True
+
+    def enable_backward_hooks(self):
+        self.backward_hooks_enabled = True
+
+    def set_accum_passes(accum_passes: bool):
+        self.accum_passes = accum_passes
 
     def parametrized_modules(self) -> Iterable[nn.Module]:
         """
@@ -182,7 +203,7 @@ class GradSampleModule(nn.Module):
         ):
             return
 
-        if not self.hooks_enabled:
+        if not self.forward_hooks_enabled:
             return
 
         if not hasattr(module, "activations"):
@@ -198,7 +219,7 @@ class GradSampleModule(nn.Module):
         batch_first: bool,
     ):
         """Captures backprops in backward pass and store per-sample gradients."""
-        if not self.hooks_enabled:
+        if not self.backward_hooks_enabled:
             return
 
         backprops = forward_output[0].detach()
@@ -206,7 +227,8 @@ class GradSampleModule(nn.Module):
             module, backprops, loss_reduction, batch_first
         )
         grad_sampler_fn = self.GRAD_SAMPLERS[type(module)]
-        grad_sampler_fn(module, activations, backprops)
+        add_grad_sample_fn = create_or_accumulate_grad_sample if self.accum_passes else create_or_extend_grad_sample
+        grad_sampler_fn(module, activations, backprops, add_grad_sample_fn)
 
         if (
             not isinstance(module.activations, list) or len(module.activations) == 0
