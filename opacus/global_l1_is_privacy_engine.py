@@ -17,7 +17,7 @@ from opacus.layers.dp_ddp import (
 
 DEFAULT_ALPHAS = [1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64))
 
-class ISPrivacyEngine(PrivacyEngine):
+class GlobalISPrivacyEngine(PrivacyEngine):
     def __init__(
         self,
         module: nn.Module,
@@ -35,7 +35,7 @@ class ISPrivacyEngine(PrivacyEngine):
         poisson: bool = False,
         per_param: bool = False,
         scaling_vec: List[float] = None,
-        beta: float = 0.0,
+        input_shape: Tuple[int] = None,
         **misc_settings,
     ):
 
@@ -49,8 +49,8 @@ class ISPrivacyEngine(PrivacyEngine):
         self.per_param = per_param
         self.batch_sensitivity = []
         self.set_scaling_vec([1.0 for _ in module.parameters()] if scaling_vec is None else scaling_vec)
-        self.beta = beta
         self.skip_layers = None
+        self.input_shape = input_shape
 
         if isinstance(
             module, DifferentiallyPrivateDistributedDataParallel
@@ -62,6 +62,7 @@ class ISPrivacyEngine(PrivacyEngine):
             rank = 0
             n_replicas = 1
 
+        self.check_IS_constant()
         self.module = module
 
         if poisson:
@@ -146,6 +147,21 @@ class ISPrivacyEngine(PrivacyEngine):
 
     def load_state_dict(self, state_dict):
         self.steps = state_dict["steps"]
+
+    def check_IS_constant(self):
+        self.module.zero_grad()
+
+        inp = torch.empty(self.input_shape).fill_(1e-3)
+        inp.requires_grad_()
+        loss = self.module(inp, max_sens=True).mean()
+
+        first_order_grads = torch.autograd.grad(loss, self.module.parameters(), retain_graph=True, create_graph=True)
+        grad_l1_norm = torch.norm(torch.cat([x.reshape(-1) for x in first_order_grads]), p=1)
+        sensitivity_vec = torch.autograd.grad(grad_l1_norm, inp, create_graph=True, retain_graph=True)[0]
+        s = sensitivity_vec.reshape(sensitivity_vec.size(0), -1).norm(p=1, dim=1)
+
+        if s.max() > 0:
+            raise Exception("Module does not have constant IS across inputs.")
 
     def detach(self):
         r"""
@@ -285,8 +301,22 @@ class ISPrivacyEngine(PrivacyEngine):
     def zero_grad(self):
         self.batch_sensitivity = 0
 
-    def backward(self, loss, inputs, store_to_grad=True):
+    def step(self, is_empty: bool = False):
+        self.steps += 1
 
+        params = (p for p in self.module.parameters() if p.requires_grad)
+        for i, p in enumerate(params):
+            sens = np.exp(self.beta) * self.batch_sensitivity[i] if self.per_param else self.batch_sensitivity
+            noise = self._generate_noise(sens * self.scaling_vec[i], p.grad)
+
+            if self.rank == 0:
+                # Noise only gets added on first worker
+                # This is easy to reason about for loss_reduction=sum
+                # For loss_reduction=mean, noise will get further divided by
+                # world_size as gradients are averaged.
+                p.grad += noise
+
+    def calc_is(self, loss, inputs, max_is=False, store_to_grad=True, retain_graph=False):
         # (1) first-order gradient (wrt parameters)
         first_order_grads = torch.autograd.grad(loss, self.module.parameters(), retain_graph=True, create_graph=True)
 
@@ -295,41 +325,54 @@ class ISPrivacyEngine(PrivacyEngine):
             for i, p in enumerate(self.module.parameters()):
                 p.grad = first_order_grads[i].detach()
 
+        batch_sensitivity = []
+
         if self.per_param:
-            self.batch_sensitivity = []
-            grad_l2_norms = torch.stack([x.reshape(-1).norm(2) for x in first_order_grads], dim=0)
+            grad_l1_norms = torch.stack([x.reshape(-1).norm(1) for x in first_order_grads], dim=0)
 
-            for i, param_grad_l2_norm in enumerate(grad_l2_norms):
+            for i, param_grad_l1_norm in enumerate(grad_l1_norms):
                 if not self.skip_layers is None and self.skip_layers[i]:
-                    self.batch_sensitivity.append(0)
+                    batch_sensitivity.append(0)
                 else:
-                    sensitivity_vec = torch.autograd.grad(param_grad_l2_norm, inputs=inputs, retain_graph=True)
-                    s = [torch.norm(v, p=2).cpu().numpy().item() for v in sensitivity_vec]
+                    sensitivity_vec = torch.autograd.grad(param_grad_l1_norm, inputs=inputs, retain_graph=True)
+                    s = torch.stack([torch.norm(v, p=1) for v in sensitivity_vec])
 
-                    self.batch_sensitivity.append(np.max(s))
+                    batch_sensitivity.append(s.max())
 
-            self.batch_sensitivity = np.array(self.batch_sensitivity)
+            batch_sensitivity = torch.stack(batch_sensitivity)
 
             if self.skip_layers is None:
-                self.skip_layers = self.batch_sensitivity == 0
+                self.skip_layers = batch_sensitivity == 0
         else:
             # (2) L2 norm of the gradient from (1)
-            grad_l2_norm = torch.norm(torch.cat([x.reshape(-1) / self.scaling_vec[i] for i, x in enumerate(first_order_grads)]), p=2)
+            grad_l1_norm = torch.norm(torch.cat([x.reshape(-1) / self.scaling_vec[i] for i, x in enumerate(first_order_grads)]), p=1)
 
             # (3) Gradient (wrt inputs) of the L2 norm of the gradient from (2)
-            sensitivity_vec = torch.autograd.grad(grad_l2_norm, inputs)[0]
+            sensitivity_vec = torch.autograd.grad(grad_l1_norm, inputs, retain_graph=retain_graph)[0]
 
             # (4) L2 norm of (3) - "immediate sensitivity"
-            s = [torch.norm(v, p=2).cpu().numpy().item() for v in sensitivity_vec]
+            s = torch.stack([torch.norm(v, p=1) for v in sensitivity_vec])
 
-            self.batch_sensitivity = np.max(s)
+            batch_sensitivity = s.max()
+
+        return batch_sensitivity
+
+    def backward(self, loss, inputs, store_to_grad=True):
+        self.local_batch_is = self.calc_is(loss, inputs, store_to_grad=True, retain_graph=True).cpu().numpy()
+
+        mock_inp = torch.empty(1, *self.input_shape).fill_(1e-3).to("cuda:0") # this is very hardcoded
+        mock_inp.requires_grad_()
+        out, _ = self.module(mock_inp, max_sens=True)
+        global_batch_is = self.calc_is(out, mock_inp, store_to_grad=False)
+        # global_batch_is.backward()
+        self.global_batch_is = global_batch_is.cpu().numpy()
 
     def step(self, is_empty: bool = False):
         self.steps += 1
 
         params = (p for p in self.module.parameters() if p.requires_grad)
         for i, p in enumerate(params):
-            sens = np.exp(self.beta) * self.batch_sensitivity[i] if self.per_param else self.batch_sensitivity
+            sens = np.exp(self.beta) * self.global_batch_is[i] if self.per_param else self.global_batch_is
             noise = self._generate_noise(sens * self.scaling_vec[i], p.grad)
 
             if self.rank == 0:
@@ -544,7 +587,7 @@ class ISPrivacyEngine(PrivacyEngine):
 
         If a ``sample_rate`` is provided, it will be used.
         If no ``sample_rate``is provided, the used ``sample_rate`` will be equal to
-        ``batch_size`` /  ``sample_size``.
+        ``batch_size`` /  ``sample_size``.
         """
         if self.batch_size and not isinstance(self.batch_size, int):
             raise ValueError(

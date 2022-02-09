@@ -17,7 +17,7 @@ from opacus.layers.dp_ddp import (
 
 DEFAULT_ALPHAS = [1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64))
 
-class ISPrivacyEngine(PrivacyEngine):
+class GlobalISPrivacyEngine(PrivacyEngine):
     def __init__(
         self,
         module: nn.Module,
@@ -33,9 +33,6 @@ class ISPrivacyEngine(PrivacyEngine):
         target_epsilon: Optional[float] = None,
         epochs: Optional[float] = None,
         poisson: bool = False,
-        per_param: bool = False,
-        scaling_vec: List[float] = None,
-        beta: float = 0.0,
         **misc_settings,
     ):
 
@@ -46,11 +43,7 @@ class ISPrivacyEngine(PrivacyEngine):
         self.sample_rate = sample_rate
         self._set_sample_rate()
 
-        self.per_param = per_param
-        self.batch_sensitivity = []
-        self.set_scaling_vec([1.0 for _ in module.parameters()] if scaling_vec is None else scaling_vec)
-        self.beta = beta
-        self.skip_layers = None
+        self.batch_is = []
 
         if isinstance(
             module, DifferentiallyPrivateDistributedDataParallel
@@ -242,9 +235,6 @@ class ISPrivacyEngine(PrivacyEngine):
         """
         return self._poisson_empty_batches_distribution.rvs(size=1)[0]
 
-    def set_scaling_vec(self, scaling_vec: List[float]):
-        self.scaling_vec = scaling_vec
-
     def get_renyi_divergence(self):
         rdp = torch.tensor(
             privacy_analysis.compute_rdp(
@@ -285,45 +275,6 @@ class ISPrivacyEngine(PrivacyEngine):
     def zero_grad(self):
         self.batch_sensitivity = 0
 
-    def backward(self, loss, inputs, store_to_grad=True):
-
-        # (1) first-order gradient (wrt parameters)
-        first_order_grads = torch.autograd.grad(loss, self.module.parameters(), retain_graph=True, create_graph=True)
-
-        if store_to_grad:
-            # Store gradients while we're at it so we don't have to loss.backward()
-            for i, p in enumerate(self.module.parameters()):
-                p.grad = first_order_grads[i].detach()
-
-        if self.per_param:
-            self.batch_sensitivity = []
-            grad_l2_norms = torch.stack([x.reshape(-1).norm(2) for x in first_order_grads], dim=0)
-
-            for i, param_grad_l2_norm in enumerate(grad_l2_norms):
-                if not self.skip_layers is None and self.skip_layers[i]:
-                    self.batch_sensitivity.append(0)
-                else:
-                    sensitivity_vec = torch.autograd.grad(param_grad_l2_norm, inputs=inputs, retain_graph=True)
-                    s = [torch.norm(v, p=2).cpu().numpy().item() for v in sensitivity_vec]
-
-                    self.batch_sensitivity.append(np.max(s))
-
-            self.batch_sensitivity = np.array(self.batch_sensitivity)
-
-            if self.skip_layers is None:
-                self.skip_layers = self.batch_sensitivity == 0
-        else:
-            # (2) L2 norm of the gradient from (1)
-            grad_l2_norm = torch.norm(torch.cat([x.reshape(-1) / self.scaling_vec[i] for i, x in enumerate(first_order_grads)]), p=2)
-
-            # (3) Gradient (wrt inputs) of the L2 norm of the gradient from (2)
-            sensitivity_vec = torch.autograd.grad(grad_l2_norm, inputs)[0]
-
-            # (4) L2 norm of (3) - "immediate sensitivity"
-            s = [torch.norm(v, p=2).cpu().numpy().item() for v in sensitivity_vec]
-
-            self.batch_sensitivity = np.max(s)
-
     def step(self, is_empty: bool = False):
         self.steps += 1
 
@@ -331,6 +282,68 @@ class ISPrivacyEngine(PrivacyEngine):
         for i, p in enumerate(params):
             sens = np.exp(self.beta) * self.batch_sensitivity[i] if self.per_param else self.batch_sensitivity
             noise = self._generate_noise(sens * self.scaling_vec[i], p.grad)
+
+            if self.rank == 0:
+                # Noise only gets added on first worker
+                # This is easy to reason about for loss_reduction=sum
+                # For loss_reduction=mean, noise will get further divided by
+                # world_size as gradients are averaged.
+                p.grad += noise
+
+    def backward(self, loss, inputs, store_to_grad=True):
+        loss.backward(retain_graph=True)
+        self.global_batch_is = []
+        self.local_batch_is = []
+
+        params = list(self.module.named_parameters())
+        reshaped_input = inputs.reshape(inputs.size(0), -1)
+
+        for i, (name, p) in enumerate(params):
+            # NOTE: This is assuming only linear layers with no bias or nonlinear activations/loss
+
+            if name.endswith("bias"):
+                self.global_batch_is.append(0)
+            else:
+                # Calculate w
+                w = torch.eye(reshaped_input.size(1), device=inputs.device)
+                for j in range(i):
+                    if not params[j][0].endswith("bias"):
+                        w = torch.mm(w, params[j][1].transpose(0,1))
+                w = w.transpose(0,1)
+
+                o = torch.eye(p.size(0), device=inputs.device)
+                for j in range(i+1, len(params)):
+                    if not params[j][0].endswith("bias"):
+                        o = torch.mm(o, params[j][1].transpose(0,1))
+                o = o.transpose(0,1)
+
+                iw = torch.mm(reshaped_input, w.transpose(0,1))
+
+                # grad = torch.autograd.grad(loss, p, create_graph=True, retain_graph=True)[0]
+                # imm_sens = torch.autograd.grad(grad.norm(2), inputs, create_graph=True)[0].reshape(inputs.size(0), -1).norm(p=2, dim=1)
+                # print("Actual IS Mean, Max, Std:",imm_sens.mean().item(), imm_sens.max().item(), imm_sens.std().item())
+
+                predicted_is = (o.norm(2) / iw.norm(2)) * torch.mm(iw, w).norm(2, dim=1)
+                # print("Predicted IS Mean, Max, Std:",predicted_is.mean().item(), predicted_is.max().item(), predicted_is.std().item())
+                self.local_batch_is.append(predicted_is.max().item())
+
+                is_upper_bound = o.norm(2) * w.norm(2)
+                if is_upper_bound > 1:
+                    (is_upper_bound*0.1).backward(retain_graph=True)
+                # print("Upper bound:",is_upper_bound.item())
+
+                self.global_batch_is.append(is_upper_bound.item())
+
+        self.global_batch_is = np.array(self.global_batch_is)
+        self.local_batch_is = np.array(self.local_batch_is)
+
+    def step(self, is_empty: bool = False):
+        self.steps += 1
+
+        params = (p for p in self.module.parameters() if p.requires_grad)
+        for i, p in enumerate(params):
+            sens = self.global_batch_is[i]
+            noise = self._generate_noise(sens, p.grad)
 
             if self.rank == 0:
                 # Noise only gets added on first worker
@@ -544,7 +557,7 @@ class ISPrivacyEngine(PrivacyEngine):
 
         If a ``sample_rate`` is provided, it will be used.
         If no ``sample_rate``is provided, the used ``sample_rate`` will be equal to
-        ``batch_size`` /  ``sample_size``.
+        ``batch_size`` /  ``sample_size``.
         """
         if self.batch_size and not isinstance(self.batch_size, int):
             raise ValueError(
